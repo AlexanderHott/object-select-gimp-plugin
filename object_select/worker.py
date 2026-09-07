@@ -13,9 +13,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import numpy as np
 from PIL import Image
 
-from comparison.imaging import mask_image
-from comparison.models import ModelRunner
+from object_select.imaging import mask_image
 from object_select.masks import clean_mask
+from object_select.models import ModelRunner
 
 
 def encode(image):

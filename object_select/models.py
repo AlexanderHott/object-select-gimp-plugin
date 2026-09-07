@@ -9,7 +9,7 @@ from dataclasses import dataclass
 import numpy as np
 from PIL import Image
 
-from comparison.imaging import crop_bounds, make_trimap
+from object_select.imaging import make_trimap
 
 CATALOG = {
     "sam3": {"label": "SAM 3", "repo": "facebook/sam3", "kind": "sam", "gated": True},
@@ -23,16 +23,6 @@ CATALOG = {
         "label": "SAM 2.1 · large",
         "repo": "facebook/sam2.1-hiera-large",
         "kind": "sam",
-    },
-    "birefnet": {
-        "label": "BiRefNet lite",
-        "repo": "ZhengPeng7/BiRefNet_lite",
-        "kind": "foreground",
-    },
-    "birefnet-crop": {
-        "label": "BiRefNet lite · selected crop",
-        "repo": "ZhengPeng7/BiRefNet_lite",
-        "kind": "refine",
     },
     "vitmatte": {
         "label": "ViTMatte · selected mask",
@@ -62,7 +52,7 @@ class ModelRunner:
     def _device(self):
         import torch
 
-        requested = os.environ.get("COMPARISON_DEVICE", "auto")
+        requested = os.environ.get("OBJECT_SELECT_DEVICE", "auto")
         if requested != "auto":
             return requested
         if torch.cuda.is_available():
@@ -83,7 +73,6 @@ class ModelRunner:
         import torch
         from huggingface_hub import HfApi, try_to_load_from_cache
         from transformers import (
-            AutoModelForImageSegmentation,
             Sam2Model,
             Sam2Processor,
             Sam3TrackerModel,
@@ -104,7 +93,7 @@ class ModelRunner:
             torch.cuda.empty_cache()
         self.device = self._device()
         torch.set_num_threads(
-            int(os.environ.get("COMPARISON_THREADS", min(8, os.cpu_count() or 4)))
+            int(os.environ.get("OBJECT_SELECT_THREADS", min(8, os.cpu_count() or 4)))
         )
         cached = try_to_load_from_cache(repo, "config.json")
         if isinstance(cached, str):
@@ -123,16 +112,6 @@ class ModelRunner:
             )
             self.processor = processor_cls.from_pretrained(repo, **options)
             self.model = model_cls.from_pretrained(repo, **options).to(self.device).eval()
-        elif model_id.startswith("birefnet"):
-            self.model = (
-                AutoModelForImageSegmentation.from_pretrained(
-                    repo,
-                    trust_remote_code=True,
-                    **options,
-                )
-                .to(self.device)
-                .eval()
-            )
         else:
             self.processor = VitMatteImageProcessor.from_pretrained(repo, **options)
             self.model = (
@@ -171,7 +150,6 @@ class ModelRunner:
         self, request: dict, image: Image.Image, parent: np.ndarray | None, progress: Callable
     ):
         import torch
-        from torchvision.transforms import InterpolationMode, v2
 
         model_id = request["model"]
         load_seconds = self._load(model_id, progress)
@@ -212,39 +190,6 @@ class ModelRunner:
                 masks = [masks_tensor[i].numpy().astype(np.float32) for i in order]
                 scores = [float(scores_array[i]) for i in order]
                 details["output_kind"] = "binary segmentation"
-            elif model_id.startswith("birefnet"):
-                box = crop_bounds(parent, request["crop_padding"]) if parent is not None else None
-                source = image.crop(box) if box else image
-                transform = v2.Compose(
-                    [
-                        v2.Resize((1024, 1024), interpolation=InterpolationMode.BILINEAR),
-                        v2.ToImage(),
-                        v2.ToDtype(torch.float32, scale=True),
-                        v2.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-                    ]
-                )
-                inputs = transform(source).unsqueeze(0).to(self.device)
-                progress("Predicting foreground at 1024 × 1024")
-                prediction = self.model(inputs)[-1].sigmoid()
-                prediction = (
-                    torch.nn.functional.interpolate(
-                        prediction,
-                        size=(source.height, source.width),
-                        mode="bilinear",
-                        align_corners=False,
-                    )[0, 0]
-                    .float()
-                    .cpu()
-                    .numpy()
-                )
-                if box:
-                    full = np.zeros((image.height, image.width), dtype=np.float32)
-                    full[box[1] : box[3], box[0] : box[2]] = prediction
-                    prediction = full
-                masks, scores = [prediction], [None]
-                details.update(
-                    crop=box, model_input=[1024, 1024], output_kind="soft foreground mask"
-                )
             else:
                 trimap = make_trimap(parent, request["matte_radius"])
                 size = image.size

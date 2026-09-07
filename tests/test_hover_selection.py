@@ -4,8 +4,8 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from comparison.models import Prediction
 from object_select.masks import clean_mask
+from object_select.models import Prediction
 from object_select.worker import Session, decode, encode
 
 ROOT = Path(__file__).resolve().parents[1]

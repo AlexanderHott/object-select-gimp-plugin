@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from comparison.models import Prediction
+from object_select.models import Prediction
 from object_select.worker import Session, decode, encode
 
 
