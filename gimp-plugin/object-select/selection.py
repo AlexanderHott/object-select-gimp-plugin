@@ -1,0 +1,61 @@
+"""Selection state shared by the GTK UI and tests. No GIMP objects live here."""
+
+from PIL import Image, ImageChops
+
+
+class Selection:
+    def __init__(self, size):
+        self.mask = Image.new("L", size)
+        self.history = []
+
+    def accept(self, candidate, mode="new"):
+        if candidate.size != self.mask.size:
+            raise ValueError("Selection dimensions differ from the layer.")
+        self.history.append(self.mask.copy())
+        # Bound undo memory to 128 MiB, retaining at least one previous mask.
+        limit = max(1, min(20, 128_000_000 // (self.mask.width * self.mask.height)))
+        self.history = self.history[-limit:]
+        if mode == "new":
+            self.mask = candidate.copy()
+        elif mode == "add":
+            self.mask = ImageChops.lighter(self.mask, candidate)
+        elif mode == "subtract":
+            self.mask = ImageChops.subtract(self.mask, candidate)
+        elif mode == "intersect":
+            self.mask = ImageChops.darker(self.mask, candidate)
+        else:
+            raise ValueError("Unknown selection operation.")
+
+    def undo(self):
+        if self.history:
+            self.mask = self.history.pop()
+
+    def clear(self):
+        self.accept(Image.new("L", self.mask.size))
+
+
+def pick_candidate(masks, point=None, smaller=False):
+    """Prefer masks containing the prompt; SAM scores already order candidates."""
+    if not masks:
+        raise ValueError("The model returned no masks.")
+    candidates = [mask for mask in masks if mask.getbbox()]
+    if point:
+        contained = [mask for mask in candidates if mask.getpixel(point) > 127]
+        if not contained:
+            return Image.new("L", masks[0].size)
+        candidates = contained
+    if not candidates:
+        return masks[0]
+    if smaller:
+        return min(candidates, key=lambda mask: sum(mask.histogram()[128:]))
+    return candidates[0]
+
+
+def image_coordinates(x, y, viewport, image_size):
+    scale = min(viewport[0] / image_size[0], viewport[1] / image_size[1])
+    left = (viewport[0] - image_size[0] * scale) / 2
+    top = (viewport[1] - image_size[1] * scale) / 2
+    px, py = int((x - left) // scale), int((y - top) // scale)
+    if 0 <= px < image_size[0] and 0 <= py < image_size[1]:
+        return px, py
+    return None

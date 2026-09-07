@@ -1,0 +1,153 @@
+"""Run with GIMP's Python to check on-demand hover and stale-result handling."""
+
+import sys
+from pathlib import Path
+from types import MethodType, SimpleNamespace
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "gimp-plugin" / "object-select"))
+from PIL import Image
+from selection import Selection
+from ui import HoverDialog
+
+
+class Bridge:
+    def __init__(self):
+        self.requests = []
+
+    def submit(self, request, callback):
+        self.requests.append((request, callback))
+        return len(self.requests)
+
+    def discard_pending(self):
+        pass
+
+
+def controller():
+    state = SimpleNamespace(
+        epoch=0,
+        hover_timer=None,
+        closed=False,
+        bridge=Bridge(),
+        scope=SimpleNamespace(get_active_id=lambda: "object"),
+        model=SimpleNamespace(get_active_id=lambda: "sam2-large"),
+        tool=SimpleNamespace(get_active_id=lambda: "hover"),
+        auto_cleanup=SimpleNamespace(get_active=lambda: False),
+        status=SimpleNamespace(set_text=lambda text: None),
+        update=lambda: None,
+        candidate=None,
+        candidates=[],
+        candidate_index=0,
+        selection=Selection((20, 20)),
+        drag=None,
+        pointer=None,
+        locked=False,
+        ready=True,
+        image_ready=False,
+        warming=False,
+        location=lambda event: event.point,
+    )
+    for name in (
+        "worker_ready",
+        "warm_model",
+        "controls_changed",
+        "predict",
+        "invalidate",
+        "cancel_requests",
+        "next_candidate",
+        "accept",
+        "leave",
+        "failed",
+        "motion",
+        "scope_changed",
+    ):
+        setattr(state, name, MethodType(getattr(HoverDialog, name), state))
+    return state
+
+
+large = Image.new("L", (20, 20), 255)
+small = Image.new("L", (20, 20))
+small.paste(255, (6, 6, 11, 11))
+
+
+def reply(callback):
+    callback({"masks": [large, small], "seconds": 0.02})
+
+
+with patch("ui.GLib.timeout_add") as timer, patch("ui.GLib.source_remove"):
+    timer.return_value = 123
+    state = controller()
+    state.worker_ready()
+    assert state.bridge.requests[0][0] == {"op": "warmup", "model": "sam2-large"}
+    assert state.warming and not state.ready
+    state.motion(None, SimpleNamespace(point=(8, 8)))
+    assert len(state.bridge.requests) == 1
+    timer.assert_not_called()
+    epoch = state.epoch
+    state.controls_changed(state.tool)
+    state.scope_changed(None)
+    assert state.epoch == epoch, "Picking controls must not interrupt model loading"
+    old_finished = state.bridge.requests[0][1]
+    state.controls_changed(state.model)
+    old_finished({"ready": True})
+    assert not state.ready, "A stale model load must not enable picking"
+    state.bridge.requests[-1][1]({"ready": True})
+    assert state.ready and not state.warming and not state.locked
+    assert all(request["op"] == "warmup" for request, _ in state.bridge.requests)
+    state.bridge.requests.clear()
+    print("PASS: startup and model changes encode without regions; loading blocks picks safely")
+
+    state.motion(None, SimpleNamespace(point=(8, 8)))
+    delay, callback = timer.call_args.args
+    assert delay == 180 and state.bridge.requests == []
+    callback()
+    request, finished = state.bridge.requests[-1]
+    assert request["op"] == "predict" and "remember" not in request
+    assert request["points"] == [{"x": 8, "y": 8, "label": 1}]
+    timer.reset_mock()
+    reply(finished)
+    assert state.candidate is large and not state.selection.mask.getbbox()
+    timer.assert_not_called()
+    state.motion(None, SimpleNamespace(point=(8, 8)))
+    assert len(state.bridge.requests) == 1
+    timer.assert_not_called()
+    print("PASS: one exact-point prediction after dwell; stationary hover never replaces it")
+
+    state.motion(None, SimpleNamespace(point=(9, 8)))
+    assert state.candidate is None
+    assert timer.called, "A one-pixel move must be available for narrow regions"
+    old_timer = timer.call_args.args[1]
+    state.motion(None, SimpleNamespace(point=(10, 8)))
+    old_timer()
+    assert len(state.bridge.requests) == 1, "Obsolete dwell callbacks must not start predictions"
+    timer.call_args.args[1]()
+    assert state.bridge.requests[-1][0]["points"][0]["x"] == 10
+    print("PASS: exact pixel targeting and stale dwell cancellation")
+
+    for action in ("cycle", "accept", "move", "leave"):
+        state = controller()
+        state.predict((8, 8))
+        old_finished = state.bridge.requests[-1][1]
+        reply(old_finished)
+        if action == "cycle":
+            state.next_candidate()
+        elif action == "accept":
+            state.accept(large, "new", (8, 8))
+        elif action == "move":
+            state.predict((12, 12))
+        else:
+            state.leave()
+        kept = state.candidate
+        old_finished({"masks": [small.copy()], "seconds": 0.02})
+        assert state.candidate is kept, action
+    print("PASS: cycling, acceptance, movement and leaving reject stale results")
+
+    state = controller()
+    state.predict((8, 8), commit=True)
+    reply(state.bridge.requests[-1][1])
+    assert state.selection.mask.getbbox() == large.getbbox()
+    state.predict((8, 8))
+    state.bridge.requests[-1][1]({"masks": [], "seconds": 0.02})
+    assert state.candidate is None
+    assert state.selection.mask.getbbox() == large.getbbox()
+    print("PASS: direct click selects; an empty result preserves the accepted selection")
