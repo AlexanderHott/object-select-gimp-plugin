@@ -9,6 +9,8 @@ gi.require_version("Gimp", "3.0")
 gi.require_version("Gegl", "0.4")
 gi.require_version("Babl", "0.1")
 from gi.repository import Babl, Gegl, Gimp
+
+sys.path.append(Gimp.directory() + "/plug-ins/object-select/vendor")
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]

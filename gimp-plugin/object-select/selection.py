@@ -7,6 +7,8 @@ class Selection:
     def __init__(self, size):
         self.mask = Image.new("L", size)
         self.history = []
+        self.future = []
+        self.revision = 0
 
     def accept(self, candidate, mode="new"):
         if candidate.size != self.mask.size:
@@ -15,6 +17,8 @@ class Selection:
         # Bound undo memory to 128 MiB, retaining at least one previous mask.
         limit = max(1, min(20, 128_000_000 // (self.mask.width * self.mask.height)))
         self.history = self.history[-limit:]
+        self.future = []
+        self.revision += 1
         if mode == "new":
             self.mask = candidate.copy()
         elif mode == "add":
@@ -28,10 +32,35 @@ class Selection:
 
     def undo(self):
         if self.history:
+            self.future.append(self.mask)
             self.mask = self.history.pop()
+            self.revision += 1
+
+    def redo(self):
+        if self.future:
+            self.history.append(self.mask)
+            self.mask = self.future.pop()
+            self.revision += 1
 
     def clear(self):
         self.accept(Image.new("L", self.mask.size))
+
+
+def coverage(mask):
+    """Return the selected share of the layer, counting soft pixels by their weight."""
+    total = sum(value * count for value, count in enumerate(mask.histogram()))
+    return total / (255 * mask.width * mask.height)
+
+
+def effective_mode(mode, shift=False, ctrl=False, alt=False):
+    """Apply GIMP's selection modifiers, with Alt as a second way to subtract."""
+    if shift and ctrl:
+        return "intersect"
+    if shift:
+        return "add"
+    if ctrl or alt:
+        return "subtract"
+    return mode
 
 
 def pick_candidate(masks, point=None, smaller=False):

@@ -12,12 +12,12 @@ def mask_image(mask: np.ndarray) -> Image.Image:
 def make_trimap(mask: np.ndarray, radius: int) -> np.ndarray:
     foreground = mask >= 0.5
     if not foreground.any() or foreground.all():
-        raise ValueError("Matting needs a mask containing both foreground and background.")
+        raise ValueError("Refine edges needs picks that cover only part of the layer.")
     inside = ndimage.distance_transform_edt(np.pad(foreground, 1))[1:-1, 1:-1]
     outside = ndimage.distance_transform_edt(~foreground)
     trimap = np.full(mask.shape, 128, dtype=np.uint8)
     trimap[outside > radius] = 0
     trimap[inside > radius] = 255
     if not (trimap == 255).any():
-        raise ValueError("The unknown band covers the whole object. Reduce the matting band width.")
+        raise ValueError("The edge band covers the whole object. Reduce Edge band.")
     return trimap

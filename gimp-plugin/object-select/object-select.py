@@ -2,6 +2,7 @@
 """GIMP entry point for hover-and-pick object selection."""
 
 import sys
+from pathlib import Path
 
 import gi
 
@@ -11,6 +12,21 @@ gi.require_version("Gegl", "0.4")
 from gi.repository import Gegl, Gimp, GimpUi, GLib
 
 PROCEDURE = "plug-in-object-select-hover"
+# The installer puts Pillow here when GIMP's Python has none. GIMP's own copy takes priority.
+sys.path.append(str(Path(__file__).resolve().parent / "vendor"))
+
+
+def load_dialog():
+    try:
+        from ui import HoverDialog
+    except ImportError as error:
+        if "PIL" not in str(error) and "Pillow" not in str(error):
+            raise
+        raise RuntimeError(
+            "GIMP's Python can't load Pillow. This can happen after a GIMP update. "
+            "Rerun the installer: uv run python -m object_select.install"
+        ) from error
+    return HoverDialog
 
 
 def run(procedure, run_mode, image, drawables, config, run_data):
@@ -24,9 +40,7 @@ def run(procedure, run_mode, image, drawables, config, run_data):
             raise ValueError("Select a pixel layer rather than a layer group.")
         Gegl.init(None)
         GimpUi.init("object-select")
-        from ui import HoverDialog
-
-        applied = HoverDialog(image, layer).run_selection()
+        applied = load_dialog()(image, layer).run_selection()
         status = Gimp.PDBStatusType.SUCCESS if applied else Gimp.PDBStatusType.CANCEL
         return procedure.new_return_values(status, None)
     except Exception as error:  # noqa: BLE001 - report failures at the process/UI boundary

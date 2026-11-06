@@ -13,6 +13,8 @@ gi.require_version("GimpUi", "3.0")
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gegl", "0.4")
 from gi.repository import Gegl, Gimp, GimpUi, GLib, Gtk
+
+sys.path.append(Gimp.directory() + "/plug-ins/object-select/vendor")
 from PIL import Image, ImageDraw
 
 sys.path.insert(0, Gimp.directory() + "/plug-ins/object-select")
@@ -56,18 +58,18 @@ def tick():
             assert dialog.bridge.serial == 1, "Startup should only load the model and image"
             assert replies[0][0]["op"] == "warmup" and "masks" not in replies[0][1]
             frames = [
-                widget.get_label() for widget in walk(dialog) if isinstance(widget, Gtk.Frame)
+                widget.get_label()
+                for widget in walk(dialog)
+                if isinstance(widget, Gtk.Frame) and widget.get_label()
             ]
-            assert frames == [
-                "1. Set up",
-                "2. Pick objects",
-                "3. Inspect & clean up",
-                "4. Apply to GIMP",
-            ]
+            assert frames == ["Tool", "Candidates", "Picks", "Model"], frames
             expanders = [widget for widget in walk(dialog) if isinstance(widget, Gtk.Expander)]
             assert len(expanders) == 2 and all(not widget.get_expanded() for widget in expanders)
             assert dialog.matte_output.get_active_id() == "crisp"
             assert dialog.matte_threshold.get_value() == 50
+            dialog.mode.highlight("add")
+            assert dialog.mode.get_active_id() == "new", "Highlighting must not change the mode"
+            dialog.mode.highlight("new")
             dialog.matte_output.set_active_id("soft")
             assert not dialog.matte_threshold.is_sensitive()
             dialog.matte_output.set_active_id("crisp")
@@ -81,6 +83,7 @@ def tick():
                 SimpleNamespace(
                     x=dialog.area.get_allocated_width() / 2,
                     y=dialog.area.get_allocated_height() / 2,
+                    state=0,
                 ),
             )
             phase = "hover"

@@ -185,3 +185,35 @@ def test_cleanup_only_command_preserves_transparency_without_loading_model():
 def test_cleanup_can_be_disabled_without_changing_soft_coverage():
     mask = np.array([[0, 0.2, 0.7, 1]], dtype=np.float32)
     np.testing.assert_array_equal(clean_mask(mask, hole_area=0, smooth_radius=0), mask)
+
+
+def test_redo_restores_undone_masks_until_a_new_pick():
+    state = selection.Selection((2, 1))
+    first = Image.fromarray(np.array([[255, 0]], dtype=np.uint8))
+    second = Image.fromarray(np.array([[0, 255]], dtype=np.uint8))
+    state.accept(first)
+    state.accept(second)
+    state.undo()
+    assert np.asarray(state.mask).ravel().tolist() == [255, 0]
+    state.redo()
+    assert np.asarray(state.mask).ravel().tolist() == [0, 255]
+    state.undo()
+    state.accept(second, "add")
+    state.redo()
+    assert np.asarray(state.mask).ravel().tolist() == [255, 255], "A new pick clears redo"
+
+
+def test_modifiers_follow_gimp_selection_conventions():
+    assert selection.effective_mode("new") == "new"
+    assert selection.effective_mode("intersect") == "intersect"
+    assert selection.effective_mode("new", shift=True) == "add"
+    assert selection.effective_mode("new", ctrl=True) == "subtract"
+    assert selection.effective_mode("new", alt=True) == "subtract"
+    assert selection.effective_mode("new", shift=True, ctrl=True) == "intersect"
+
+
+def test_coverage_counts_soft_pixels_by_weight():
+    mask = Image.fromarray(np.array([[255, 0, 0, 255]], dtype=np.uint8))
+    assert selection.coverage(mask) == 0.5
+    soft = Image.fromarray(np.array([[51, 51]], dtype=np.uint8))
+    assert selection.coverage(soft) == 0.2
