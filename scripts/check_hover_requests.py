@@ -83,6 +83,7 @@ def controller():
         "pick_mode",
         "restore_hover",
         "candidate_status",
+        "refine_all",
     ):
         setattr(state, name, MethodType(getattr(HoverDialog, name), state))
     return state
@@ -188,3 +189,38 @@ with patch("ui.GLib.timeout_add") as timer, patch("ui.GLib.source_remove"):
     assert state.candidate is None
     assert state.selection.mask.getbbox() == large.getbbox()
     print("PASS: direct click selects; an empty result preserves the accepted selection")
+
+    state = controller()
+    state.predict((8, 8), commit=True)
+    assert state.bridge.requests[-1][0]["refine"] is False
+    reply(state.bridge.requests[-1][1])
+    state.predict((8, 8), commit=True, mode="subtract")
+    state.bridge.requests[-1][1]({"masks": [small]})
+    assert state.selection.unrefined() == 2
+    coarse = state.selection.mask.tobytes()
+    state.bridge.requests.clear()
+    state.refine_all()
+    assert state.locked and state.busy_title.startswith("Refining pick 1 of 2")
+    assert state.selection.mask.tobytes() == coarse, "Only a finished replay may change picks"
+    request, finished = state.bridge.requests[-1]
+    assert request["op"] == "pick" and request["refine"] is True and request["points"][0]["x"] == 8
+    finished({"masks": [large]})
+    assert state.busy_title.startswith("Refining pick 2 of 2")
+    state.bridge.requests[-1][1]({"masks": [small]})
+    assert not state.locked and state.selection.unrefined() == 0
+    assert (
+        state.selection.mask.getpixel((8, 8)) == 0 and state.selection.mask.getpixel((1, 1)) == 255
+    )
+    state.selection.undo()
+    assert state.selection.mask.tobytes() == coarse and state.selection.unrefined() == 2
+    print("PASS: Refine all replays every pick in order as one undo step")
+
+    state.refine_all()
+    finished = state.bridge.requests[-1][1]
+    state.invalidate()
+    finished({"masks": [large]})
+    assert state.selection.mask.tobytes() == coarse and len(state.selection.picks) == 2
+    state.refine_all()
+    state.bridge.requests[-1][1]({"error": "boom"})
+    assert not state.locked and state.selection.mask.tobytes() == coarse
+    print("PASS: cancelling or failing Refine all leaves the picks untouched")

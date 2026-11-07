@@ -47,6 +47,9 @@ shown_at = None
 shown_mask = None
 before_refine = None
 crisp_mask = None
+coarse_mask = None
+picked_at = None
+picked_index = None
 replies = []
 
 
@@ -59,6 +62,7 @@ def walk(widget):
 
 def tick():
     global phase, shown_at, shown_mask, before_refine, crisp_mask
+    global coarse_mask, picked_at, picked_index
     try:
         if time.monotonic() - started > 240:
             raise AssertionError("Dialog timeout: " + dialog.status.get_text())
@@ -112,6 +116,7 @@ def tick():
             Gtk.Widget.draw(dialog, cairo.Context(surface))
             surface.write_to_png(PANEL)
             print("PASS: real SAM preview remains stable with one request", flush=True)
+            picked_at, picked_index = dialog.hover_point, dialog.candidate_index
             dialog.commit_candidate("new")
             assert dialog.locked and dialog.ghost is shown_mask, "Show the pick while it refines"
             phase = "picked"
@@ -147,6 +152,25 @@ def tick():
             dialog.undo()
             assert dialog.selection.mask.tobytes() == before_refine.tobytes()
             print("PASS: real ViTMatte soft coverage and Undo", flush=True)
+            dialog.auto_refine.set_active(False)
+            dialog.predict(picked_at, commit=True, mode="new", candidate=picked_index)
+            phase = "coarse"
+        elif phase == "coarse" and not dialog.pending:
+            assert dialog.selection.unrefined() == 1
+            assert dialog.refine_all_button.get_sensitive()
+            coarse_mask = dialog.selection.mask.copy()
+            dialog.refine_all()
+            assert dialog.locked and not dialog.refine_all_button.get_sensitive()
+            phase = "all"
+        elif phase == "all" and not dialog.pending:
+            assert dialog.selection.unrefined() == 0, dialog.status.get_text()
+            assert not dialog.refine_all_button.get_sensitive()
+            assert dialog.selection.mask.tobytes() == before_refine.tobytes(), (
+                "Refining later must match refining at the click"
+            )
+            dialog.undo()
+            assert dialog.selection.mask.tobytes() == coarse_mask.tobytes()
+            print("PASS: Refine all matches refining at the click, and Undo restores", flush=True)
             dialog.accept(crisp_mask, "new", None)
             dialog.response(Gtk.ResponseType.OK)
             return False

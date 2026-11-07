@@ -170,6 +170,8 @@ class ModelRunner:
         started = time.perf_counter()
         self.model = self.processor = self.embeddings = None
         self.embedding_key = self.loaded_repo = None
+        # One model's logits mean nothing to another, so corrections start over.
+        self.pick_logits = None
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

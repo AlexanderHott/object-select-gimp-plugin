@@ -16,11 +16,15 @@ from gimp_io import apply, snapshot
 from PIL import Image, ImageChops
 from preview import render_base, render_candidate
 from selection import (
+    Pick,
     Selection,
     coverage,
     effective_mode,
     image_coordinates,
+    pack,
     pick_candidate,
+    refine_plan,
+    replay,
 )
 from widgets import (
     Choice,
@@ -85,7 +89,7 @@ SHORTCUTS = (
 class HoverDialog(Gtk.Dialog):
     def __init__(self, image, layer):
         super().__init__(title=f"Object Select – {layer.get_name()}", modal=True)
-        self.set_default_size(1060, 730)
+        self.set_default_size(1060, 860)
         self.image, self.layer = image, layer
         self.source = snapshot(layer)
         self.selection = Selection(self.source.size)
@@ -241,6 +245,15 @@ class HoverDialog(Gtk.Dialog):
         )
         selected.pack_start(actions, False, False, 0)
 
+        self.auto_refine = Gtk.CheckButton(label="Refine edges of each pick")
+        self.auto_refine.set_active(True)
+        self.auto_refine.set_tooltip_text(
+            "Slower, with much cleaner contours. Turn off to keep the model's coarse mask."
+        )
+        edges = section(controls, "Edges")
+        edges.pack_start(self.auto_refine, False, False, 0)
+        self.refine_all_button = text_button(edges, "Refine all picks", self.refine_all)
+
         cleanup = details(controls, "Clean up")
         self.hole_area = spin(
             0, 10000, 16, 64, "Fill small enclosed holes. Larger openings stay unselected."
@@ -261,13 +274,6 @@ class HoverDialog(Gtk.Dialog):
         for widget in (self.hole_area, self.smoothing, self.island_area):
             widget.connect("value-changed", self.controls_changed)
         self.cleanup_button = text_button(cleanup, "Clean selected mask", self.cleanup)
-
-        self.auto_refine = Gtk.CheckButton(label="Refine edges of each pick")
-        self.auto_refine.set_active(True)
-        self.auto_refine.set_tooltip_text(
-            "Slower, with much cleaner contours. Turn off to keep the model's coarse mask."
-        )
-        section(controls, "Edges").pack_start(self.auto_refine, False, False, 0)
 
         matting = details(controls, "Hair and fur")
         self.matte_threshold = spin(
@@ -722,6 +728,13 @@ class HoverDialog(Gtk.Dialog):
             button.set_tooltip_text(
                 blocked or no_model or (f"Runs {label} on the picked edges." if label else None)
             )
+        coarse = self.selection.unrefined()
+        self.refine_all_button.set_sensitive(self.ready and coarse > 0 and not self.locked)
+        self.refine_all_button.set_tooltip_text(
+            f"Refine the coarse edges of {coarse} pick{'' if coarse == 1 else 's'}."
+            if coarse
+            else "Every pick already has refined edges."
+        )
         self.clear_button.set_sensitive(has_selection and not self.locked)
         self.undo_button.set_sensitive(bool(self.selection.history) and not self.locked)
         self.redo_button.set_sensitive(bool(self.selection.future) and not self.locked)
@@ -1031,16 +1044,18 @@ class HoverDialog(Gtk.Dialog):
                 return
             if commit:
                 mask = masks[0]
+                pick = Pick(request, mode, pack(mask) if request["refine"] else None)
                 if mask.getbbox() is None:
                     self.status.set_text("Nothing was selected there. Try Include or a box.")
                     self.update()
                 elif mode == "correction":
                     # Replace only the most recently picked object, preserving other picks.
-                    self.accept(ImageChops.lighter(previous_base, mask), "new", self.last_seed)
+                    merged = ImageChops.lighter(previous_base, mask)
+                    self.accept(merged, "new", self.last_seed, pick)
                     self.last_base = previous_base
                     self.last_points = points
                 else:
-                    self.accept(mask, mode, point or self.mask_seed(mask))
+                    self.accept(mask, mode, point or self.mask_seed(mask), pick)
                 return
             mask = pick_candidate(masks, point, smaller)
             if mask.getbbox() is None:
@@ -1086,9 +1101,9 @@ class HoverDialog(Gtk.Dialog):
                     return x, y
         return None
 
-    def accept(self, mask, mode, seed):
+    def accept(self, mask, mode, seed, pick=None):
         self.last_base = self.selection.mask.copy() if mode == "add" else Image.new("L", mask.size)
-        self.selection.accept(mask, mode)
+        self.selection.accept(mask, mode, pick)
         self.last_seed = seed if mode in ("new", "add") else None
         self.last_points = [{"x": seed[0], "y": seed[1], "label": 1}] if seed else []
         self.invalidate()
@@ -1201,6 +1216,65 @@ class HoverDialog(Gtk.Dialog):
         self.last_seed = None
         self.status.set_text("Picks cleared. Undo restores them.")
         self.update()
+
+    def refine_all(self):
+        """Refine every coarse pick in order, then show the result as one undo step."""
+        if self.locked or not self.selection.unrefined():
+            return
+        self.invalidate()
+        epoch = self.epoch
+        origin, picks = self.selection.origin, self.selection.picks
+        plan = refine_plan(picks)
+        total = self.selection.unrefined()
+        results = {}
+        self.locked = self.pending = True
+        self.hide_error()
+
+        def finish():
+            self.locked = self.pending = False
+            self.busy_title = None
+            refined = [
+                Pick(pick.request, pick.mode, pack(results[index]))
+                if index in results and pick.mask is None
+                else pick
+                for index, pick in enumerate(picks)
+            ]
+            mask, base = replay(origin, refined, results)
+            self.selection.replace(mask, refined)
+            self.last_base = base
+            self.pointer = None
+            self.status.set_text("Picks refined. Undo restores the coarse edges.")
+            self.update()
+
+        def run(step):
+            if step == len(plan):
+                finish()
+                return
+            index, refining = plan[step]
+            if refining:
+                done = sum(1 for item, flag in plan[:step] if flag)
+                self.busy_title = f"Refining pick {done + 1} of {total} (Esc cancels)"
+                self.busy_detail.set_text("")
+                self.status.set_text("Refining all picks…")
+                self.update()
+
+            def finished(result):
+                if epoch != self.epoch or self.closed:
+                    return
+                if "error" in result:
+                    self.failed(result["error"])
+                    return
+                if refining:
+                    results[index] = (
+                        result["masks"][0] if result["masks"] else Image.new("L", origin.size)
+                    )
+                run(step + 1)
+
+            self.current_request = self.bridge.submit(
+                {**picks[index].request, "refine": refining}, finished
+            )
+
+        run(0)
 
     def refine(self):
         self.invalidate()

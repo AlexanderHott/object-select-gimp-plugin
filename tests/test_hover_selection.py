@@ -217,3 +217,132 @@ def test_coverage_counts_soft_pixels_by_weight():
     assert selection.coverage(mask) == 0.5
     soft = Image.fromarray(np.array([[51, 51]], dtype=np.uint8))
     assert selection.coverage(soft) == 0.2
+
+
+def solid(size, box):
+    mask = Image.new("L", size)
+    mask.paste(255, box)
+    return mask
+
+
+def test_undo_and_redo_keep_picks_in_step_with_masks():
+    state = selection.Selection((4, 1))
+    first = selection.Pick({"points": [1]}, "new")
+    second = selection.Pick({"points": [2]}, "add")
+    state.accept(solid((4, 1), (0, 0, 1, 1)), "new", first)
+    state.accept(solid((4, 1), (1, 0, 2, 1)), "add", second)
+    assert state.picks == (first, second) and state.unrefined() == 2
+    state.undo()
+    assert state.picks == (first,)
+    state.redo()
+    assert state.picks == (first, second)
+
+
+def test_results_without_a_pick_become_the_replay_origin():
+    """A hair-refined or cleaned mask can't be split into picks, so later picks build on it."""
+    state = selection.Selection((4, 1))
+    state.accept(solid((4, 1), (0, 0, 1, 1)), "new", selection.Pick({}, "new"))
+    whole = solid((4, 1), (0, 0, 2, 1))
+    state.accept(whole, "new")
+    assert state.picks == () and state.unrefined() == 0
+    assert state.origin.tobytes() == whole.tobytes()
+    state.accept(solid((4, 1), (3, 0, 4, 1)), "add", selection.Pick({}, "add"))
+    assert state.unrefined() == 1 and state.origin.tobytes() == whole.tobytes()
+
+
+def test_a_new_pick_drops_older_picks_from_the_replay():
+    state = selection.Selection((4, 1))
+    state.accept(solid((4, 1), (0, 0, 1, 1)), "new", selection.Pick({}, "new"))
+    state.accept(solid((4, 1), (1, 0, 2, 1)), "add", selection.Pick({}, "add"))
+    state.accept(solid((4, 1), (2, 0, 3, 1)), "new", selection.Pick({"last": True}, "new"))
+    assert len(state.picks) == 1 and state.origin.getbbox() is None
+
+
+def test_plan_refines_only_coarse_picks_and_restores_the_last_chain():
+    done = selection.pack(Image.new("L", (1, 1)))
+    coarse = selection.Pick({}, "add")
+    refined = selection.Pick({}, "add", done)
+    assert selection.refine_plan((coarse, coarse)) == [(0, True), (1, True)]
+    assert selection.refine_plan((coarse, refined)) == [(0, True), (1, False)]
+    assert selection.refine_plan((refined, coarse)) == [(1, True)]
+
+
+def test_plan_decodes_a_correction_chain_but_refines_only_its_end():
+    done = selection.pack(Image.new("L", (1, 1)))
+    head = selection.Pick({}, "new")
+    fix = selection.Pick({}, "correction")
+    assert selection.refine_plan((head, fix, fix)) == [(0, False), (1, False), (2, True)]
+    refined_head = selection.Pick({}, "new", done)
+    assert selection.refine_plan((refined_head, fix)) == [(0, False), (1, True)]
+    other = selection.Pick({}, "add", done)
+    assert selection.refine_plan((head, fix, other)) == [(0, False), (1, True), (2, False)]
+
+
+def test_superseded_picks_do_not_count_as_coarse():
+    state = selection.Selection((2, 1))
+    done = selection.pack(Image.new("L", (2, 1)))
+    state.accept(Image.new("L", (2, 1)), "new", selection.Pick({}, "new"))
+    state.accept(Image.new("L", (2, 1)), "new", selection.Pick({}, "correction", done))
+    assert state.unrefined() == 0
+
+
+def test_replay_rebuilds_every_combination_in_order():
+    size = (6, 1)
+    a, b, c = solid(size, (0, 0, 3, 1)), solid(size, (2, 0, 5, 1)), solid(size, (1, 0, 2, 1))
+    picks = (
+        selection.Pick({}, "new"),
+        selection.Pick({}, "add"),
+        selection.Pick({}, "subtract"),
+    )
+    mask, _ = selection.replay(Image.new("L", size), picks, {0: a, 1: b, 2: c})
+    assert list(mask.tobytes()) == [255, 0, 255, 255, 255, 0]
+    picks = (selection.Pick({}, "new"), selection.Pick({}, "intersect"))
+    mask, _ = selection.replay(Image.new("L", size), picks, {0: a, 1: b})
+    assert list(mask.tobytes()) == [0, 0, 255, 0, 0, 0]
+
+
+def test_replay_reuses_stored_results_and_starts_from_the_origin():
+    size = (4, 1)
+    origin = solid(size, (0, 0, 1, 1))
+    stored = selection.pack(solid(size, (1, 0, 2, 1)))
+    picks = (selection.Pick({}, "add", stored), selection.Pick({}, "add"))
+    mask, base = selection.replay(origin, picks, {1: solid(size, (2, 0, 3, 1))})
+    assert list(mask.tobytes()) == [255, 255, 255, 0]
+    assert list(base.tobytes()) == [255, 255, 0, 0], "A later correction needs this base"
+
+
+def test_replay_applies_a_correction_over_only_its_own_pick():
+    size = (4, 1)
+    first = solid(size, (0, 0, 1, 1))
+    fixed = solid(size, (1, 0, 2, 1))
+    picks = (
+        selection.Pick({}, "new"),
+        selection.Pick({}, "add"),
+        selection.Pick({}, "correction"),
+    )
+    mask, _ = selection.replay(Image.new("L", size), picks, {0: first, 2: fixed})
+    assert list(mask.tobytes()) == [255, 255, 0, 0], "The first pick stays; the second is replaced"
+
+
+def test_replay_skips_corrections_that_a_later_correction_replaced():
+    size = (4, 1)
+    picks = (
+        selection.Pick({}, "new"),
+        selection.Pick({}, "correction"),
+        selection.Pick({}, "correction"),
+    )
+    final = solid(size, (1, 0, 2, 1))
+    mask, _ = selection.replay(Image.new("L", size), picks, {2: final})
+    assert list(mask.tobytes()) == [0, 255, 0, 0]
+
+
+def test_replace_is_one_undo_step():
+    state = selection.Selection((2, 1))
+    coarse = selection.Pick({}, "new")
+    state.accept(solid((2, 1), (0, 0, 1, 1)), "new", coarse)
+    done = selection.Pick({}, "new", selection.pack(solid((2, 1), (0, 0, 2, 1))))
+    state.replace(solid((2, 1), (0, 0, 2, 1)), (done,))
+    assert state.unrefined() == 0
+    state.undo()
+    assert state.picks == (coarse,) and state.unrefined() == 1
+    assert list(state.mask.tobytes()) == [255, 0]

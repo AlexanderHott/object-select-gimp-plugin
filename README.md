@@ -49,7 +49,7 @@ The installer copies the GIMP interface, adds Pillow if needed, and writes the r
 
 Shift-click a part that SAM missed. Right-click to exclude a part from the last pick. These corrections reuse the previous mask, so the rest of the selection stays put.
 
-For hair and fur, open **Hair and fur** and choose **Refine hair and fur** to run ViTMatte on the picked edges. To skip refinement on slow machines, turn off **Refine edges of each pick**.
+For hair and fur, open **Hair and fur** and choose **Refine hair and fur** to run ViTMatte on the picked edges. To pick quickly, turn off **Refine edges of each pick**, make your picks, and then choose **Refine all picks**. Undo restores the coarse edges in one step.
 
 ## Update or uninstall
 
