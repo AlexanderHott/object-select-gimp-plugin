@@ -1,7 +1,7 @@
 [project]
 name = "object-select-gimp-plugin"
 version = "0.1.0"
-description = "GIMP 3 object selection with local SAM models and ViTMatte edge refinement"
+description = "GIMP 3 object selection with local SAM, BiRefNet, and ViTMatte models"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
 dependencies = [
@@ -12,6 +12,7 @@ dependencies = [
     "torchvision>=0.22,<1",
     "transformers>=5.3,<6",
     "huggingface-hub>=1,<2",
+    "onnxruntime>=1.20,<2",
 ]
 
 [dependency-groups]

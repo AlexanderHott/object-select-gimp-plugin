@@ -15,7 +15,10 @@ from PIL import Image
 
 from object_select.imaging import mask_image
 from object_select.masks import clean_mask
-from object_select.models import ModelRunner
+from object_select.models import ModelRunner, preview_size
+
+SAM_MODELS = {"sam2-tiny", "sam2-base", "sam2-large", "sam3"}
+MATTE_MAX_SIDE = 1536
 
 
 def encode(image):
@@ -50,12 +53,14 @@ class Session:
             raise ValueError("Send an image before requesting a selection.")
         if command["op"] == "warmup":
             model = command.get("model", "sam2-large")
-            if model not in {"sam2-tiny", "sam2-base", "sam2-large", "sam3"}:
+            if model not in SAM_MODELS:
                 raise ValueError("Choose a SAM model to load for picking.")
             timings = self.runner.warmup(model, self.image_id, self.image, progress)
             return {"ready": True, **timings}
-        if command["op"] not in {"predict", "cleanup"}:
-            raise ValueError("Unsupported operation. Use warmup, predict, or cleanup.")
+        if command["op"] not in {"predict", "pick", "cleanup"}:
+            raise ValueError("Unsupported operation. Use warmup, predict, pick, or cleanup.")
+        if command["op"] == "pick":
+            return self.pick(command, progress)
         if command["op"] == "cleanup":
             mask = np.asarray(decode(command["mask"]).convert("L"), dtype=np.float32) / 255
             if mask.shape != self.alpha.shape:
@@ -64,7 +69,7 @@ class Session:
             mask = clean_mask(mask, **command.get("cleanup", {}))
             return {"masks": [encode(mask_image(np.minimum(mask, self.alpha)))]}
         model = command.get("model", "sam2-large")
-        if model not in {"sam2-tiny", "sam2-base", "sam2-large", "sam3", "vitmatte"}:
+        if model not in SAM_MODELS | {"vitmatte"}:
             raise ValueError("Unsupported selection model.")
         parent = None
         if model == "vitmatte":
@@ -89,14 +94,18 @@ class Session:
             "points": points,
             "box": command.get("box"),
             "matte_radius": command.get("radius", 10),
-            "matte_max_side": 1024,
+            "matte_max_side": MATTE_MAX_SIDE,
+            "continue": command.get("continue", False),
         }
+        preview = model != "vitmatte" and bool(command.get("preview"))
+        if preview:
+            request["output_size"] = preview_size(self.image.size)
         prediction = self.runner.predict(request, self.image, parent, progress)
         masks = prediction.masks
         if model == "vitmatte" and matte_output == "crisp":
             # Threshold the resized matte before PNG quantization and layer-alpha clipping.
             masks = [(mask >= threshold).astype(np.float32) for mask in masks]
-        if model != "vitmatte" and command.get("cleanup") is not None:
+        if model != "vitmatte" and not preview and command.get("cleanup") is not None:
             excluded = [
                 (int(point["x"]), int(point["y"])) for point in points if point["label"] == 0
             ]
@@ -109,13 +118,46 @@ class Session:
                 )
                 for mask in masks
             ]
-        masks = [np.minimum(np.clip(mask, 0, 1), self.alpha) for mask in masks]
+        alpha = self.alpha
+        if preview:
+            alpha = np.asarray(
+                Image.fromarray(alpha).resize(request["output_size"], Image.Resampling.BILINEAR)
+            )
+        masks = [np.minimum(np.clip(mask, 0, 1), alpha) for mask in masks]
         return {
             "masks": [encode(mask_image(mask)) for mask in masks],
             "scores": prediction.scores,
             "seconds": prediction.metadata["predict_seconds"],
             "cached": prediction.metadata.get("cached_embeddings", False),
+            "preview": preview,
         }
+
+    def pick(self, command, progress):
+        """Refine the chosen candidate into the final mask for the layer."""
+        model = command.get("model", "sam2-large")
+        if model not in SAM_MODELS:
+            raise ValueError("Unsupported selection model.")
+        points = command.get("points", [])
+        for point in points:
+            if not (0 <= point["x"] < self.image.width and 0 <= point["y"] < self.image.height):
+                raise ValueError("Point outside the layer.")
+        alpha = self.runner.pick(
+            {
+                "model": model,
+                "image_id": self.image_id,
+                "points": points,
+                "box": command.get("box"),
+                "candidate": command.get("candidate"),
+                "smaller": command.get("smaller", False),
+                "continue": command.get("continue", False),
+                "refine": command.get("refine", True),
+            },
+            self.image,
+            progress,
+        )
+        if alpha is None:
+            return {"masks": []}
+        return {"masks": [encode(mask_image(np.minimum(np.clip(alpha, 0, 1), self.alpha)))]}
 
 
 def main():

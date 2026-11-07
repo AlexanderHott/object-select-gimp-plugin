@@ -65,7 +65,7 @@ MODE_HINTS = {
 FIXED_MODE_HINTS = {"include": "Include always adds.", "exclude": "Exclude always removes."}
 PICK_ACTIONS = {"new": "Select", "add": "Add", "subtract": "Subtract", "intersect": "Intersect"}
 SHORTCUTS = (
-    ("Click or Space", "Accept the candidate"),
+    ("Click or Space", "Accept the candidate and refine its edges"),
     ("Tab or scroll", "Next candidate"),
     ("Shift+Tab", "Previous candidate"),
     ("Shift+click", "Add to your picks"),
@@ -202,7 +202,7 @@ class HoverDialog(Gtk.Dialog):
         picking.pack_start(row, False, False, 0)
         self.scope = Choice(
             [
-                Option("object", "Best match", tooltip="Start on the model's top candidate."),
+                Option("object", "Whole object", tooltip="Start on the largest candidate."),
                 Option("part", "Smaller part", tooltip="Start on the smallest candidate."),
             ]
         )
@@ -242,15 +242,12 @@ class HoverDialog(Gtk.Dialog):
         selected.pack_start(actions, False, False, 0)
 
         cleanup = details(controls, "Clean up")
-        self.auto_cleanup = Gtk.CheckButton(label="Clean new candidates")
-        self.auto_cleanup.set_active(True)
-        self.auto_cleanup.set_tooltip_text("Apply these settings to each candidate automatically.")
-        self.auto_cleanup.connect("toggled", self.controls_changed)
-        cleanup.pack_start(self.auto_cleanup, False, False, 0)
         self.hole_area = spin(
             0, 10000, 16, 64, "Fill small enclosed holes. Larger openings stay unselected."
         )
-        self.smoothing = spin(0, 5, 1, 1, "Round off jagged edges. 0 keeps the contour as it is.")
+        self.smoothing = spin(
+            0, 5, 1, 0, "Round off the contour. This also rounds points and makes edges hard."
+        )
         self.island_area = spin(
             0,
             1_000_000,
@@ -265,7 +262,14 @@ class HoverDialog(Gtk.Dialog):
             widget.connect("value-changed", self.controls_changed)
         self.cleanup_button = text_button(cleanup, "Clean selected mask", self.cleanup)
 
-        matting = details(controls, "Refine edges")
+        self.auto_refine = Gtk.CheckButton(label="Refine edges of each pick")
+        self.auto_refine.set_active(True)
+        self.auto_refine.set_tooltip_text(
+            "Slower, with much cleaner contours. Turn off to keep the model's coarse mask."
+        )
+        section(controls, "Edges").pack_start(self.auto_refine, False, False, 0)
+
+        matting = details(controls, "Hair and fur")
         self.matte_threshold = spin(
             1,
             99,
@@ -277,14 +281,14 @@ class HoverDialog(Gtk.Dialog):
         self.matte_output = Choice(
             [
                 Option(
-                    "crisp",
-                    "Crisp",
-                    tooltip="Threshold the refined boundary without smoothing.",
-                ),
-                Option(
                     "soft",
                     "Soft matte",
                     tooltip="Keep partial coverage for hair and transparency.",
+                ),
+                Option(
+                    "crisp",
+                    "Crisp",
+                    tooltip="Threshold the refined boundary without smoothing.",
                 ),
             ]
         )
@@ -303,14 +307,15 @@ class HoverDialog(Gtk.Dialog):
             )
 
         self.matte_output.connect("changed", output_changed)
-        self.refine_button = text_button(matting, "Refine edges", self.refine)
+        output_changed(None)
+        self.refine_button = text_button(matting, "Refine hair and fur", self.refine)
 
         self.model = combo(
             [
-                ("sam2-large", "SAM 2.1 large · best edges"),
+                ("sam2-large", "SAM 2.1 large · recommended"),
                 ("sam2-base", "SAM 2.1 base+ · balanced"),
                 ("sam2-tiny", "SAM 2.1 tiny · fastest"),
-                ("sam3", "SAM 3 · access required"),
+                ("sam3", "SAM 3 · much slower, access required"),
             ]
         )
         self.model.connect("changed", self.controls_changed)
@@ -955,7 +960,7 @@ class HoverDialog(Gtk.Dialog):
         elif tool == "include":
             self.predict(point, commit=True, mode="add")
         elif self.candidate is not None and point == self.hover_point:
-            self.accept(self.candidate, mode, self.hover_point)
+            self.commit_candidate(mode)
         else:
             self.predict(point, commit=True, mode=mode)
         return True
@@ -982,15 +987,17 @@ class HoverDialog(Gtk.Dialog):
         self.predict(None, commit=True, mode=mode, box=box)
         return True
 
-    def predict(self, point, commit=False, mode="new", box=None):
+    def predict(self, point, commit=False, mode="new", box=None, candidate=None):
         if not self.ready:
             return
-        ghost, memory = self.ghost, self.hover_memory
+        chosen, ghost, memory = self.candidate, self.ghost, self.hover_memory
         self.invalidate()
-        if not commit:
-            self.ghost, self.hover_memory = ghost, memory
         if commit:
             self.hide_error()
+            # Keep showing what was clicked while its edges are refined.
+            self.ghost = chosen
+        else:
+            self.ghost, self.hover_memory = ghost, memory
         epoch = self.epoch
         self.locked = commit
         self.pending = True
@@ -999,6 +1006,10 @@ class HoverDialog(Gtk.Dialog):
             points = self.last_points + [{"x": point[0], "y": point[1], "label": 0}]
         smaller = self.scope.get_active_id() == "part"
         previous_base = self.last_base.copy() if mode == "correction" else None
+        refining = commit and self.auto_refine.get_active()
+        if refining:
+            self.busy_title = "Refining edges (Esc cancels)"
+            self.busy_detail.set_text("")
         self.status.set_text("Finding object…" if not commit else "Selecting object…")
         self.update()
 
@@ -1007,6 +1018,7 @@ class HoverDialog(Gtk.Dialog):
                 return
             self.locked = False
             self.pending = False
+            self.busy_title = None
             self.ghost = None
             self.hover_memory = None
             if "error" in result:
@@ -1017,36 +1029,51 @@ class HoverDialog(Gtk.Dialog):
                 self.status.set_text("No candidate found. Try Include or a box.")
                 self.update()
                 return
-            mask = pick_candidate(masks, self.last_seed if mode == "correction" else point, smaller)
-            if mask.getbbox() is None:
-                self.status.set_text("No candidate contains the pointer. Try Include or a box.")
-                self.update()
-                return
             if commit:
-                if mode == "correction":
+                mask = masks[0]
+                if mask.getbbox() is None:
+                    self.status.set_text("Nothing was selected there. Try Include or a box.")
+                    self.update()
+                elif mode == "correction":
                     # Replace only the most recently picked object, preserving other picks.
                     self.accept(ImageChops.lighter(previous_base, mask), "new", self.last_seed)
                     self.last_base = previous_base
                     self.last_points = points
                 else:
                     self.accept(mask, mode, point or self.mask_seed(mask))
-            else:
-                self.candidates = masks
-                self.candidate = mask
-                self.candidate_index = next(i for i, item in enumerate(masks) if item is mask)
-                self.hover_point = point
-                self.hide_error()
-                self.status.set_text(self.candidate_status())
+                return
+            mask = pick_candidate(masks, point, smaller)
+            if mask.getbbox() is None:
+                self.status.set_text("No candidate contains the pointer. Try Include or a box.")
                 self.update()
+                return
+            self.candidates = masks
+            self.candidate = mask
+            self.candidate_index = next(i for i, item in enumerate(masks) if item is mask)
+            self.hover_point = point
+            self.hide_error()
+            self.status.set_text(self.candidate_status())
+            self.update()
 
-        request = {
-            "op": "predict",
-            "model": self.model.get_active_id(),
-            "points": points,
-            "box": box,
-            "cleanup": self.cleanup_settings() if self.auto_cleanup.get_active() else None,
-        }
+        model = self.model.get_active_id()
+        if commit:
+            request = {
+                "op": "pick",
+                "model": model,
+                "points": points,
+                "box": box,
+                "candidate": candidate,
+                "smaller": smaller,
+                "continue": mode == "correction",
+                "refine": self.auto_refine.get_active(),
+            }
+        else:
+            request = {"op": "predict", "model": model, "points": points, "preview": True}
         self.current_request = self.bridge.submit(request, finished)
+
+    def commit_candidate(self, mode):
+        """Refine the candidate on screen. Its index still means the same mask to the worker."""
+        self.predict(self.hover_point, commit=True, mode=mode, candidate=self.candidate_index)
 
     def mask_seed(self, mask):
         bounds = mask.getbbox()
@@ -1067,12 +1094,12 @@ class HoverDialog(Gtk.Dialog):
         self.invalidate()
         self.hide_error()
         self.pointer = None
-        self.status.set_text("Picked. Keep picking, refine the edges, or apply.")
+        self.status.set_text("Picked. Keep picking or apply.")
         self.update()
 
     def accept_candidate(self):
         if self.candidate is not None and not self.locked:
-            self.accept(self.candidate, self.pick_mode(), self.hover_point)
+            self.commit_candidate(self.pick_mode())
 
     def next_candidate(self, step=1):
         if self.candidates:

@@ -93,6 +93,12 @@ class Bridge:
                 reply = self.exchange(request)
                 if "masks" in reply:
                     reply["masks"] = [decode(mask) for mask in reply["masks"]]
+                    if reply.get("preview"):
+                        # Upscale off the main thread. The rest of the UI uses layer-sized masks.
+                        reply["masks"] = [
+                            mask.resize(self.source.size, Image.Resampling.BILINEAR)
+                            for mask in reply["masks"]
+                        ]
                 self.dispatch(callback, reply)
         except Exception as error:  # noqa: BLE001 - report failures at the process/UI boundary
             self.dispatch(self.on_error, str(error))

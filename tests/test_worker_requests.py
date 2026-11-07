@@ -137,3 +137,52 @@ def test_invalid_refinement_options_are_rejected_before_inference(settings):
             print,
         )
     assert not runner.requests
+
+
+def test_hover_returns_small_previews_and_keeps_layer_transparency():
+    class Runner:
+        def predict(self, request, image, parent, progress):
+            assert request["output_size"] == (1024, 512)
+            width, height = request["output_size"]
+            return Prediction([np.ones((height, width))], [0.9], {"predict_seconds": 0.01})
+
+    source = Image.new("RGBA", (4000, 2000), "white")
+    source.paste((255, 255, 255, 0), (0, 0, 2000, 2000))
+    session = Session(Runner())
+    session.handle({"op": "image", "image": encode(source)}, lambda _: None)
+    result = session.handle(
+        {"op": "predict", "points": [{"x": 3000, "y": 1000, "label": 1}], "preview": True},
+        lambda _: None,
+    )
+    mask = decode(result["masks"][0])
+    assert result["preview"] and mask.size == (1024, 512)
+    assert mask.getpixel((100, 100)) == 0 and mask.getpixel((900, 100)) == 255
+
+
+def test_pick_passes_the_hovered_candidate_and_clips_to_the_layer():
+    class Runner:
+        def pick(self, request, image, progress):
+            assert request["candidate"] == 2 and request["refine"] and not request["continue"]
+            assert request["points"] == [{"x": 1, "y": 0, "label": 1}]
+            return np.ones((1, 3), dtype=np.float32)
+
+    rgba = Image.new("RGBA", (3, 1), "white")
+    rgba.putalpha(Image.fromarray(np.array([[0, 128, 255]], dtype=np.uint8)))
+    session = Session(Runner())
+    session.handle({"op": "image", "image": encode(rgba)}, lambda _: None)
+    result = session.handle(
+        {"op": "pick", "points": [{"x": 1, "y": 0, "label": 1}], "candidate": 2}, lambda _: None
+    )
+    assert np.asarray(decode(result["masks"][0])).ravel().tolist() == [0, 128, 255]
+
+
+def test_pick_with_no_object_returns_no_mask_and_rejects_bad_points():
+    class Runner:
+        def pick(self, request, image, progress):
+            return None
+
+    session = Session(Runner())
+    session.handle({"op": "image", "image": encode(Image.new("RGBA", (3, 1)))}, lambda _: None)
+    assert session.handle({"op": "pick", "points": []}, lambda _: None) == {"masks": []}
+    with pytest.raises(ValueError, match="outside"):
+        session.handle({"op": "pick", "points": [{"x": 9, "y": 0, "label": 1}]}, lambda _: None)

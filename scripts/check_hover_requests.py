@@ -52,7 +52,7 @@ def controller():
         load_failed=False,
         worker_dead=False,
         tool=SimpleNamespace(get_active_id=lambda: "hover"),
-        auto_cleanup=SimpleNamespace(get_active=lambda: False),
+        auto_refine=SimpleNamespace(get_active=lambda: False),
         status=SimpleNamespace(set_text=lambda text: None),
         update=lambda: None,
         candidate=None,
