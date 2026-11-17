@@ -8,6 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+WINDOWS = sys.platform == "win32"
 PILLOW = "pillow>=11,<13"
 # Importing Image also loads the compiled module, so a build for another Python counts as missing.
 PROBE = """
@@ -20,9 +21,47 @@ except ImportError:
 print(json.dumps({
     "version": "%d.%d" % sys.version_info[:2],
     "machine": platform.machine(),
+    "platform": sys.platform,
     "pillow": pillow,
 }))
 """
+
+
+def wheel_platform(target):
+    """Name the uv platform whose Pillow wheels load in GIMP's Python."""
+    if target["platform"] == "win32":
+        arch = {"AMD64": "x86_64", "ARM64": "aarch64"}.get(target["machine"].upper())
+        return f"{arch or target['machine']}-pc-windows-msvc"
+    return f"{target['machine']}-manylinux_2_28"
+
+
+def find_windows_gimp_python():
+    """Find the Python that the GIMP 3 Windows installer puts in its default folders."""
+    folders = [os.environ.get("ProgramW6432"), os.environ.get("ProgramFiles")]
+    if os.environ.get("LOCALAPPDATA"):
+        folders.append(Path(os.environ["LOCALAPPDATA"]) / "Programs")
+    for folder in filter(None, folders):
+        found = sorted(Path(folder).glob("GIMP 3*/bin/python.exe"), reverse=True)
+        if found:
+            return found[0]
+    return None
+
+
+def windows_gimp_directory():
+    """Match Gimp.directory() on Windows: GIMP3_DIRECTORY, else the newest %APPDATA%\\GIMP\\3.x."""
+    if os.environ.get("GIMP3_DIRECTORY"):
+        return Path(os.environ["GIMP3_DIRECTORY"])
+
+    def version(path):
+        try:
+            return tuple(int(part) for part in path.name.split("."))
+        except ValueError:
+            return ()
+
+    profiles = [path for path in Path(os.environ["APPDATA"]).glob("GIMP/3.*") if version(path)]
+    if not profiles:
+        sys.exit("Start GIMP once so it creates its settings folder, or pass --plugin-dir.")
+    return max(profiles, key=version)
 
 
 def install_pillow(destination, gimp_python, model_python):
@@ -47,7 +86,7 @@ def install_pillow(destination, gimp_python, model_python):
             "--python-version",
             target["version"],
             "--python-platform",
-            f"{target['machine']}-manylinux_2_28",
+            wheel_platform(target),
             "--only-binary",
             ":all:",
             "--target",
@@ -65,22 +104,42 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plugin-dir", type=Path, help="Override the GIMP plug-ins directory")
     parser.add_argument("--native", action="store_true", help="Use a non-Flatpak GIMP installation")
+    parser.add_argument(
+        "--gimp-python",
+        type=Path,
+        help="The Python that GIMP runs plug-ins with, such as GIMP's bin\\python.exe on Windows",
+    )
     args = parser.parse_args()
     root = Path(__file__).resolve().parent.parent
-    python = root / ".venv" / "bin" / "python"
+    python = root / ".venv" / ("Scripts/python.exe" if WINDOWS else "bin/python")
     if not python.is_file():
         parser.error("Run uv sync first to create the model environment.")
-    flatpak = (
-        not args.native
-        and shutil.which("flatpak")
-        and subprocess.run(
-            ["flatpak", "info", "org.gimp.GIMP"], capture_output=True, check=False
-        ).returncode
-        == 0
-    )
-    command = ["flatpak", "run", "--command=python3", "org.gimp.GIMP"] if flatpak else ["python3"]
+    flatpak = False
+    if args.gimp_python:
+        command = [str(args.gimp_python)]
+    elif WINDOWS:
+        gimp_python = find_windows_gimp_python()
+        if gimp_python is None:
+            parser.error(
+                "Couldn't find GIMP 3. Pass --gimp-python with python.exe from GIMP's bin folder."
+            )
+        command = [str(gimp_python)]
+    else:
+        flatpak = (
+            not args.native
+            and shutil.which("flatpak")
+            and subprocess.run(
+                ["flatpak", "info", "org.gimp.GIMP"], capture_output=True, check=False
+            ).returncode
+            == 0
+        )
+        command = (
+            ["flatpak", "run", "--command=python3", "org.gimp.GIMP"] if flatpak else ["python3"]
+        )
     if args.plugin_dir:
         destination = args.plugin_dir.expanduser() / "object-select"
+    elif WINDOWS:
+        destination = windows_gimp_directory() / "plug-ins" / "object-select"
     else:
         query = subprocess.run(
             command

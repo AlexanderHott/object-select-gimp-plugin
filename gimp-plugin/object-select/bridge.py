@@ -5,16 +5,41 @@ import io
 import json
 import queue
 import subprocess
+import sys
+import tempfile
 import threading
+from pathlib import Path
 
 from gi.repository import GLib
 from PIL import Image
+
+WINDOWS = sys.platform == "win32"
+WORKER_LOG = Path(tempfile.gettempdir()) / "object-select-worker.log"
 
 
 def encode(image):
     output = io.BytesIO()
     image.save(output, format="PNG")
     return base64.b64encode(output.getvalue()).decode("ascii")
+
+
+def start_worker(command):
+    if not WINDOWS:
+        return subprocess.Popen(
+            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1
+        )
+    # GIMP has no console on Windows. An inherited stderr would become a pipe nobody reads,
+    # and the worker would block once download progress fills it, so log to a file instead.
+    with WORKER_LOG.open("w", encoding="utf-8") as log:
+        return subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=log,
+            text=True,
+            bufsize=1,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
 
 
 def decode(data):
@@ -55,12 +80,18 @@ class Bridge:
             pass
 
     def exchange(self, command):
-        self.process.stdin.write(json.dumps(command) + "\n")
-        self.process.stdin.flush()
+        message = "The model process stopped. Close and reopen Object Select."
+        if WINDOWS:
+            message += f" Details are in {WORKER_LOG}."
+        try:
+            self.process.stdin.write(json.dumps(command) + "\n")
+            self.process.stdin.flush()
+        except OSError as error:
+            raise RuntimeError(message) from error
         while not self.closed.is_set():
             line = self.process.stdout.readline()
             if not line:
-                raise RuntimeError("The model process stopped. Close and reopen Object Select.")
+                raise RuntimeError(message)
             response = json.loads(line)
             if "progress" in response:
                 self.dispatch(self.on_progress, command["id"], response["progress"])
@@ -75,9 +106,7 @@ class Bridge:
                 "-u",
                 self.settings["worker"],
             ]
-            self.process = subprocess.Popen(
-                command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1
-            )
+            self.process = start_worker(command)
             if self.closed.is_set():
                 self.stop_process()
                 return
