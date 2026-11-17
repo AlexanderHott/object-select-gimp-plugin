@@ -3,16 +3,20 @@
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import urllib.request
 from pathlib import Path
 
 WINDOWS = sys.platform == "win32"
 PILLOW = "pillow>=11,<13"
+PILLOW_MIN_MAJOR, PILLOW_BELOW_MAJOR = 11, 13
 # Importing Image also loads the compiled module, so a build for another Python counts as missing.
 PROBE = """
-import json, platform, sys
+import json, platform, sys, sysconfig
 try:
     from PIL import Image
     pillow = True
@@ -22,16 +26,42 @@ print(json.dumps({
     "version": "%d.%d" % sys.version_info[:2],
     "machine": platform.machine(),
     "platform": sys.platform,
+    "ext_suffix": sysconfig.get_config_var("EXT_SUFFIX") or "",
+    "platform_tag": sysconfig.get_platform(),
     "pillow": pillow,
 }))
 """
+# Re-import exactly what the plug-in uses, the way the plug-in arranges DLL lookup,
+# so a missing dependency surfaces here instead of at first use inside GIMP.
+VERIFY = """
+import os, sys
+vendor = sys.argv[1]
+if hasattr(os, "add_dll_directory"):
+    os.add_dll_directory(os.path.join(vendor, "PIL"))
+sys.path.insert(0, vendor)
+from PIL import Image, ImageChops, ImageDraw, ImageFilter
+Image.new("RGB", (4, 4)).filter(ImageFilter.GaussianBlur(1))
+print("ok")
+"""
+
+# GIMP's Windows Python is an MSYS2 build, so its compiled modules load only MSYS2
+# (not PyPI/MSVC) binaries. These map sysconfig.get_platform() to the MSYS2
+# repository folder and package-name prefix that match it.
+MSYS2_MIRRORS = (
+    "https://repo.msys2.org/mingw/",
+    "https://ftp.osuosl.org/pub/msys2/mingw/",
+    "https://mirror.umd.edu/msys2/mingw/",
+)
+MSYS2_ENVIRONMENTS = {
+    "mingw_x86_64_ucrt_llvm": ("clang64", "mingw-w64-clang-x86_64-"),
+    "mingw_aarch64_ucrt_llvm": ("clangarm64", "mingw-w64-clang-aarch64-"),
+    "mingw_x86_64_ucrt": ("ucrt64", "mingw-w64-ucrt-x86_64-"),
+    "mingw_x86_64": ("mingw64", "mingw-w64-x86_64-"),
+}
 
 
 def wheel_platform(target):
     """Name the uv platform whose Pillow wheels load in GIMP's Python."""
-    if target["platform"] == "win32":
-        arch = {"AMD64": "x86_64", "ARM64": "aarch64"}.get(target["machine"].upper())
-        return f"{arch or target['machine']}-pc-windows-msvc"
     return f"{target['machine']}-manylinux_2_28"
 
 
@@ -64,6 +94,116 @@ def windows_gimp_directory():
     return max(profiles, key=version)
 
 
+def msys2_fetch(path):
+    """Read one repository path from the first MSYS2 mirror that serves it."""
+    errors = []
+    for base in MSYS2_MIRRORS:
+        request = urllib.request.Request(
+            base + path, headers={"User-Agent": "object-select-installer"}
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                return response.read()
+        except OSError as error:
+            errors.append(f"  {base + path}: {error}")
+    raise RuntimeError("Couldn't reach the MSYS2 package mirrors:\n" + "\n".join(errors))
+
+
+def msys2_versions(env_dir, package):
+    """List a package's releases as (sort_key, pkgver, filename), newest first."""
+    index = msys2_fetch(env_dir + "/").decode("utf-8", "replace")
+    pattern = re.escape(package) + r"-(\d[^\"<]*?)-(\d+)-any\.pkg\.tar\.zst"
+    releases = {}
+    for pkgver, pkgrel in re.findall(pattern, index):
+        filename = f"{package}-{pkgver}-{pkgrel}-any.pkg.tar.zst"
+        numbers = [int(part) for part in re.findall(r"\d+", pkgver)]
+        releases[filename] = ((numbers, int(pkgrel)), pkgver, filename)
+    return sorted(releases.values(), reverse=True)
+
+
+def msys2_extract(env_dir, filename, workdir):
+    """Download one MSYS2 package into workdir and unpack it, returning its root."""
+    archive = workdir / filename
+    archive.write_bytes(msys2_fetch(env_dir + "/" + filename))
+    extract = workdir / filename[: -len(".pkg.tar.zst")]
+    extract.mkdir()
+    try:
+        subprocess.run(
+            ["tar", "-C", str(extract), "-xf", str(archive)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        sys.exit("Unpacking GIMP's Pillow needs the 'tar' command, which ships with Windows 10+.")
+    return extract
+
+
+def install_pillow_msys2(vendor, target):
+    """Vendor an MSYS2 Pillow whose binaries match GIMP's MSYS2 Python."""
+    platform_tag = target["platform_tag"]
+    environment = MSYS2_ENVIRONMENTS.get(platform_tag)
+    if environment is None:
+        sys.exit(
+            f"GIMP's Python ({platform_tag}) isn't a recognised MSYS2 build, so the matching "
+            "Pillow can't be fetched. Install Pillow into GIMP's Python yourself, or report this."
+        )
+    env_dir, prefix = environment
+    ext_suffix = target["ext_suffix"]
+    work = Path(tempfile.mkdtemp(prefix="object-select-pillow-"))
+    try:
+        pillow_version = None
+        pil_source = None
+        tried = []
+        for _, pkgver, filename in msys2_versions(env_dir, prefix + "python-pillow"):
+            major = int(re.findall(r"\d+", pkgver)[0])
+            if not PILLOW_MIN_MAJOR <= major < PILLOW_BELOW_MAJOR:
+                continue
+            tried.append(pkgver)
+            extract = msys2_extract(env_dir, filename, work)
+            # The compiled module name carries the ABI tag; a match means this build loads.
+            found = list(extract.glob(f"**/site-packages/PIL/_imaging{ext_suffix}"))
+            if found:
+                pil_source, pillow_version = found[0].parent, pkgver
+                break
+            shutil.rmtree(extract, ignore_errors=True)
+            if len(tried) >= 6:
+                break
+        if pil_source is None:
+            sys.exit(
+                f"No Pillow {PILLOW} in the MSYS2 {env_dir} repository matches GIMP's Python "
+                f"(needs _imaging{ext_suffix}). Tried: {', '.join(tried) or 'none'}."
+            )
+        # GIMP bundles Pillow's other libraries (zlib, libjpeg, libtiff, ...); libimagequant
+        # is the one it omits, so vendor it beside the compiled modules that load it.
+        quant = msys2_versions(env_dir, prefix + "libimagequant")
+        if not quant:
+            sys.exit(f"Couldn't find libimagequant in the MSYS2 {env_dir} repository.")
+        quant_extract = msys2_extract(env_dir, quant[0][2], work)
+        shutil.copytree(pil_source, vendor / "PIL")
+        quant_dlls = sorted(quant_extract.glob("**/bin/*imagequant*.dll"))
+        if not quant_dlls:
+            sys.exit("The MSYS2 libimagequant package contained no DLL.")
+        for dll in quant_dlls:
+            shutil.copy2(dll, vendor / "PIL" / dll.name)
+        return pillow_version
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def verify_pillow(gimp_python, vendor):
+    """Confirm GIMP's Python loads the vendored Pillow before we claim success."""
+    check = subprocess.run(
+        gimp_python + ["-c", VERIFY, str(vendor)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if check.returncode != 0:
+        detail = (check.stdout + check.stderr).strip()
+        sys.exit("GIMP's Python still can't load the vendored Pillow:\n" + detail)
+
+
 def install_pillow(destination, gimp_python, model_python):
     """Vendor Pillow for GIMP's Python when GIMP doesn't provide a working copy."""
     vendor = destination / "vendor"
@@ -72,6 +212,10 @@ def install_pillow(destination, gimp_python, model_python):
     target = json.loads(probe.stdout.splitlines()[-1])
     if target["pillow"]:
         return None
+    if target["platform"] == "win32":
+        version = install_pillow_msys2(vendor, target)
+        verify_pillow(gimp_python, vendor)
+        return version
     uv = os.environ.get("UV") or shutil.which("uv")
     if not uv:
         sys.exit("GIMP's Python needs Pillow, and installing it requires uv.")
@@ -97,7 +241,8 @@ def install_pillow(destination, gimp_python, model_python):
         capture_output=True,
         check=True,
     )
-    return target["version"]
+    dist = next(iter(vendor.glob("pillow-*.dist-info")), None)
+    return dist.name.split("-")[1] if dist else target["version"]
 
 
 def main():
@@ -169,7 +314,7 @@ def main():
     pillow_version = install_pillow(destination, command, python)
     print(f"Installed Object Select in {destination}")
     if pillow_version:
-        print(f"Added Pillow for GIMP's Python {pillow_version}.")
+        print(f"Vendored Pillow {pillow_version} for GIMP's Python.")
     print("Restart GIMP, open an image, select one pixel layer, then Select > Object Select.")
     print("Keep this repository and its .venv in place; the plugin launches its model worker here.")
 

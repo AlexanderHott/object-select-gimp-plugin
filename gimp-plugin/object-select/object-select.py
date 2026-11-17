@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """GIMP entry point for hover-and-pick object selection."""
 
+import os
 import sys
 from pathlib import Path
 
@@ -13,7 +14,12 @@ from gi.repository import Gegl, Gimp, GimpUi, GLib
 
 PROCEDURE = "plug-in-object-select-hover"
 # The installer puts Pillow here when GIMP's Python has none. GIMP's own copy takes priority.
-sys.path.append(str(Path(__file__).resolve().parent / "vendor"))
+_vendor = Path(__file__).resolve().parent / "vendor"
+sys.path.append(str(_vendor))
+# On Windows the vendored Pillow ships libraries GIMP doesn't bundle (libimagequant); let the
+# compiled modules find them without disturbing GIMP's own DLL search.
+if sys.platform == "win32" and hasattr(os, "add_dll_directory") and (_vendor / "PIL").is_dir():
+    os.add_dll_directory(str(_vendor / "PIL"))
 
 
 def load_dialog():
